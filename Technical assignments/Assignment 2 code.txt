@@ -1,0 +1,510 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <math.h>
+
+// MPU-6050 Registers
+#define MPU_ADDR         0x68
+#define MPU_PWR_MGMT_1   0x6B
+#define MPU_ACCEL_XOUT_H 0x3B
+#define MPU_GYRO_ZOUT_H  0x47
+#define MPU_GYRO_CONFIG   0x1B  // Gyroscope configuration register address
+#define MPU_ACCEL_CONFIG  0x1C   // Accelerometer configuration register
+
+// Constants
+#define F_CPU 16000000UL   // CPU frequency
+#define BAUD 9600          // Baud rate for UART
+#define MYUBRR F_CPU/16/BAUD-1
+#define RAD_TO_DEG 57.2957795131
+
+// Servo limits
+#define SERVO_MIN 1000    // 1ms pulse width
+#define SERVO_MAX 2000    // 2ms pulse width
+#define YAW_MIN   -81     // Minimum yaw angle
+#define YAW_MAX    81     // Maximum yaw angle
+
+// LED brightness limits
+#define ACCEL_MIN 0.12    // Minimum acceleration for LED brightness
+#define ACCEL_MAX 1.12    // Maximum acceleration for LED brightness
+
+// Conversion factors for different ranges
+#define GYRO_SCALE_250  131.0  // For ±250 deg/s
+#define GYRO_SCALE_500  65.5   // For ±500 deg/s
+#define GYRO_SCALE_1000 32.8   // For ±1000 deg/s
+#define GYRO_SCALE_2000 16.4   // For ±2000 deg/s
+
+// Accelerometer scale factors
+#define ACCEL_SCALE_2G   16384.0  // ±2g
+#define ACCEL_SCALE_4G   8192.0   // ±4g
+#define ACCEL_SCALE_8G   4096.0   // ±8g
+#define ACCEL_SCALE_16G  2048.0   // ±16g
+
+// Variables
+volatile int16_t AcX_raw, AcY_raw, AcZ_raw;
+volatile int16_t GyZ_raw;
+volatile float AcX, AcY, AcZ;
+volatile float GyZ;
+volatile float roll, pitch, yaw;
+float gyroZoffset = 0.0;
+uint8_t currentGyroRange = 0;  // Default: ±250 deg/s
+float accelScale = ACCEL_SCALE_2G;  // Default scale (±2g)
+
+// Timing variables
+volatile unsigned long millis_count = 0;
+unsigned long prevTime = 0;
+unsigned long currTime = 0;
+float dt = 0.0;  // Delta time in seconds
+
+// Variables for distance calculation
+float velocityX = 0.0;
+float positionX = 0.0;
+
+// For output timing
+unsigned long lastOutputTime = 0;
+
+// Function prototypes
+void i2c_init(void);
+void i2c_start(void);
+void i2c_stop(void);
+void i2c_write(uint8_t data);
+uint8_t i2c_read_ack(void);
+uint8_t i2c_read_nack(void);
+
+void uart_init(unsigned int ubrr);
+void uart_transmit(unsigned char data);
+void uart_print(const char *str);
+void uart_print_float(float value);
+
+void init_timer0(void);
+void init_timer1_servo(void);
+void set_servo_angle(uint8_t angle);
+void init_timer2_led(void);
+void set_led_brightness(uint8_t brightness);
+
+void readMPU6050(void);
+void calibrateGyro(void);
+
+unsigned long millis(void);
+void Brightness(float AcX);
+
+//getting gyro scale
+float getGyroScale() {/////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    switch(currentGyroRange) {
+        case 0: return GYRO_SCALE_250;
+        case 1: return GYRO_SCALE_500;
+        case 2: return GYRO_SCALE_1000;
+        case 3: return GYRO_SCALE_2000;
+        default: return GYRO_SCALE_250;
+    }
+}
+
+void setAccelRange(uint8_t range) {
+    uint8_t value = range & 0x03;  // Mask the lower 2 bits for the range
+    
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0);  // Write to MPU-6050
+    i2c_write(MPU_ACCEL_CONFIG);     // Select ACCEL_CONFIG register
+    i2c_write(value);                // Set the range bits
+    i2c_stop();
+
+
+
+    switch(range) {
+        case 0:
+            uart_print("Accelerometer range set to ±2g\r\n");
+            break;
+        case 1:
+            uart_print("Accelerometer range set to ±4g\r\n");
+            break;
+        case 2:
+            uart_print("Accelerometer range set to ±8g\r\n");
+            break;
+        case 3:
+            uart_print("Accelerometer range set to ±16g\r\n");
+            break;
+        default:
+            uart_print("Invalid accelerometer range\r\n");
+            break;
+    }
+}
+
+int main(void) {
+    // Initialize peripherals
+    DDRB |= (1 << DDB3) | (1 << DDB5); ;  // Set PB3 and PB5 as output (LEDs)
+    DDRD |= (1 << DDD3);                // Set PD3 as output (LED brightness control)
+    i2c_init();
+    uart_init(MYUBRR);
+    init_timer0(); // For millis() function
+    init_timer1_servo(); // For servo control
+    init_timer2_led(); // For LED brightness control
+
+    // Wake up MPU-6050
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0);
+    i2c_write(MPU_PWR_MGMT_1);
+    i2c_write(0x00);
+    i2c_stop();
+
+    // Set the accelerometer range (choose from (0) ±2g,  (1) ±4g, (2) ±8g, (3) ±16g)
+    setAccelRange(0); // 0 = ±2g (default)
+
+    // setting the gyroscope range to either (0) ±250, (1) ±500, (2) ±1000, and (3) ±2000°/sec
+    setGyroRange(0);       // 0 = ±250 deg/s (default)
+
+        // Set the sample rate to 1 kHz, (7) for 1KHz, [0) for 8 KHz
+    setSampleRate(7);
+
+    // Wait for servo response at 1 kHz sample rate
+    _delay_ms(500);
+
+    //debugging log for correct gyro scaling
+    uart_print("Current Gyro Scale: ");
+    uart_print_float(getGyroScale());
+    uart_print("\r\n");
+
+    // Calibrate gyroscope
+    calibrateGyro();
+
+    // Set servo to middle position (90 degrees)
+    set_servo_angle(90);
+
+    // Enable global interrupts
+    sei();
+
+    prevTime = millis();
+    lastOutputTime = millis();
+
+    while (1) {
+        // Timing
+        currTime = millis();
+        dt = (currTime - prevTime) / 1000.0;  // Convert to seconds
+        prevTime = currTime;
+
+        readMPU6050();
+
+        // Calculate roll, pitch, and yaw
+        roll = atan2(AcY, AcZ) * RAD_TO_DEG;
+        pitch = atan2(-AcX, sqrt(AcY * AcY + AcZ * AcZ)) * RAD_TO_DEG;
+        yaw += GyZ * dt;
+
+        // Keep yaw within -180 to +180 degrees
+        if (yaw > 180.0) yaw -= 360.0;
+        if (yaw < -180.0) yaw += 360.0;
+
+        // Control servo based on yaw
+        if (yaw >= YAW_MIN && yaw <= YAW_MAX) {
+            uint8_t servoAngle = (uint8_t)((yaw + 81) * (180.0 / 162.0)); // Map yaw to servo angle
+            set_servo_angle(servoAngle);
+            //PORTB &= ~(1 << PB5); // Turn off LED "L"
+        } else {
+        // Limit servo movement if yaw exceeds ±81°
+        if (yaw < YAW_MIN) set_servo_angle(0);
+        else set_servo_angle(180);
+    }
+
+    // Control LED L based on yaw
+    if (yaw < YAW_MIN || yaw > YAW_MAX) {
+        PORTB |= (1 << PB5); // Turn on LED L
+    } else {
+        PORTB &= ~(1 << PB5); // Turn off LED L
+    }
+
+
+        // Control LED brightness based on X-axis acceleration
+        Brightness(AcX);
+
+        // Integrate acceleration to get velocity and position along X-axis
+        float accelX_mss = AcX * 9.80665;  // Convert g to m/s^2
+        velocityX += accelX_mss * dt;   // v = v0 + a * dt
+        positionX += velocityX * dt;    // x = x0 + v * dt
+
+        // Output data once per second
+        if (currTime - lastOutputTime >= 1000) {
+            lastOutputTime = currTime;
+            
+            // Print orientation and acceleration data
+            uart_print("Roll: ");
+            uart_print_float(roll);
+            uart_print(" | Pitch: ");
+            uart_print_float(pitch);
+            uart_print(" | Yaw: ");
+            uart_print_float(yaw);
+            uart_print(" | AcX: ");
+            uart_print_float(AcX);
+            uart_print("g | AcY: ");
+            uart_print_float(AcY);
+            uart_print("g | AcZ: ");
+            uart_print_float(AcZ);
+            uart_print("g | DistanceX: ");
+            uart_print_float(positionX);
+            uart_print(" m\r\n");
+            uart_print(" | Brigthness: ");
+            uart_print_float(fabs(OCR2A-255));
+            uart_print("\r\n");
+            
+        }
+
+        // Short delay for stability
+        _delay_ms(10);
+    }
+
+    return 0;
+}
+
+//=============================================================================
+// I2C Functions
+//=============================================================================
+
+void i2c_init(void) {
+    // Set SCL frequency to 400kHz (assuming F_CPU = 16MHz)
+    TWSR = 0x00; // Prescaler value
+    TWBR = 12;   // Bit rate register value for 400kHz
+}
+
+void i2c_start(void) {
+    TWCR = (1<<TWINT)|(1<<TWSTA)|(1<<TWEN);
+    while (!(TWCR & (1<<TWINT)));
+}
+
+void i2c_stop(void) {
+    TWCR = (1<<TWINT)|(1<<TWEN)|(1<<TWSTO);
+    while(TWCR & (1<<TWSTO));
+}
+
+void i2c_write(uint8_t data) {
+    TWDR = data;
+    TWCR = (1<<TWINT)|(1<<TWEN);
+    while (!(TWCR & (1<<TWINT)));
+}
+
+uint8_t i2c_read_ack(void) {
+    TWCR = (1<<TWINT)|(1<<TWEN)|(1<<TWEA);
+    while (!(TWCR & (1<<TWINT)));
+    return TWDR;
+}
+
+uint8_t i2c_read_nack(void) {
+    TWCR = (1<<TWINT)|(1<<TWEN);
+    while (!(TWCR & (1<<TWINT)));
+    return TWDR;
+}
+
+//=============================================================================
+// UART Functions
+//=============================================================================
+
+void uart_init(unsigned int ubrr) {
+    // Set baud rate
+    UBRR0H = (unsigned char)(ubrr>>8);
+    UBRR0L = (unsigned char)ubrr;
+    // Enable transmitter
+    UCSR0B = (1<<TXEN0);
+    // Set frame format: 8data, 1stop bit
+    UCSR0C = (3<<UCSZ00);
+}
+
+void uart_transmit(unsigned char data) {
+    while (!(UCSR0A & (1<<UDRE0)));
+    UDR0 = data;
+}
+
+void uart_print(const char *str) {
+    while (*str) {
+        uart_transmit(*str++);
+    }
+}
+
+void uart_print_float(float value) {
+    char buffer[20];
+    dtostrf(value, 6, 2, buffer);
+    uart_print(buffer);
+}
+
+//=============================================================================
+// Timer Functions
+//=============================================================================
+
+// Timer0 for millis()
+void init_timer0(void) {
+    // Configure Timer0 for CTC mode
+    TCCR0A = (1 << WGM01); // CTC mode
+    TCCR0B = (1 << CS01) | (1 << CS00); // Prescaler 64
+    OCR0A = 249; // Compare value for 1ms at 16MHz and prescaler 64
+    TIMSK0 = (1 << OCIE0A); // Enable Compare Match A interrupt
+}
+
+ISR(TIMER0_COMPA_vect) {
+    millis_count++;
+}
+
+unsigned long millis(void) {
+    unsigned long ms;
+    uint8_t sreg = SREG;
+    cli();
+    ms = millis_count;
+    SREG = sreg;
+    sei();
+    return ms;
+}
+
+//=============================================================================
+// Servo Control Functions (Timer1)
+//=============================================================================
+
+void init_timer1_servo(void) {
+    // Set PB1 (OC1A) as output for servo control
+    DDRB |= (1 << PB1);
+
+    // Configure Timer1 for Fast PWM, TOP = ICR1
+    TCCR1A = (1 << WGM11) | (1 << COM1A1); // Mode 14, non-inverting mode
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11); // Prescaler = 8
+
+    // Set TOP value for 50Hz PWM frequency
+    ICR1 = 39999; // 16MHz / (8 * 50Hz) - 1
+
+    // Initialize servo to center position
+    OCR1A = 3000; // Corresponds to 1.5ms pulse width
+}
+
+void set_servo_angle(uint8_t angle) {
+    // Map angle (0-180) to pulse width (1000 to 2000 microseconds)
+    uint16_t pulseWidth = ((uint32_t)angle * 1000 / 180) + 1000; // Pulse width in microseconds
+    // Convert pulse width to timer counts (each count is 0.5us with prescaler of 8)
+    OCR1A = pulseWidth * 2; // Since timer clock is 0.5us per count
+}
+
+//=============================================================================
+// LED Brightness Control Functions (Timer2)
+//=============================================================================
+
+void init_timer2_led(void) {
+    // Set PD3 (OC2B) as output for LED brightness control
+    DDRD |= (1 << PB3);
+    // Configure Timer2 for Fast PWM mode, non-inverting output on OC2B
+    TCCR2A = (1 << COM2A1) | (1 << WGM21) | (1 << WGM20);
+    // Prescaler = 64
+    TCCR2B = (1 << CS22);
+}
+
+void Brightness(float AcX) {
+    float absAcX = fabs(AcX);  // Use absolute value of acceleration
+
+    if (absAcX < ACCEL_MIN) {
+        OCR2A = 255;  // LED OFF
+        
+    } else if (absAcX > ACCEL_MAX) {
+        OCR2A = 0;  // LED 100% ON
+    } else {
+        // Linear brightness control
+        OCR2A = 255 - (uint8_t)((absAcX - ACCEL_MIN) * (255.0 / (ACCEL_MAX - ACCEL_MIN)));
+    }
+}
+
+//=============================================================================
+// MPU-6050 Functions
+//=============================================================================
+
+void readMPU6050(void) {
+    uint8_t data[14];
+
+    // Start communication with MPU-6050
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0); // Write address
+    i2c_write(MPU_ACCEL_XOUT_H); // Starting register
+    i2c_stop();
+
+    // Read 14 bytes
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 1); // Read address
+    for (uint8_t i = 0; i < 13; i++) {
+        data[i] = i2c_read_ack();
+    }
+    data[13] = i2c_read_nack();
+    i2c_stop();
+
+    // Convert raw data
+    AcX_raw = ((int16_t)data[0] << 8) | data[1];
+    AcY_raw = ((int16_t)data[2] << 8) | data[3];
+    AcZ_raw = ((int16_t)data[4] << 8) | data[5];
+    GyZ_raw = ((int16_t)data[12] << 8) | data[13];
+
+    // Convert to physical units
+     AcX = AcX_raw / accelScale;
+    AcY = AcY_raw / accelScale;
+    AcZ = AcZ_raw / accelScale;
+    
+    //GyZ = (GyZ_raw - gyroZoffset) / 131.0;
+
+    GyZ = (GyZ_raw - gyroZoffset) / getGyroScale(); ////////////////////////////////////////////////////////////////////////////////////
+}
+
+
+
+void calibrateGyro(void) {
+    uint16_t numReadings = 2000;
+    long gyroZsum = 0;
+
+    uart_print("Calibrating gyroscope...\r\n");
+
+    for (uint16_t i = 0; i < numReadings; i++) {
+        // Read gyroscope Z-axis data
+        i2c_start();
+        i2c_write((MPU_ADDR << 1) | 0); // Write address
+        i2c_write(MPU_GYRO_ZOUT_H); // Gyro Z-axis high byte
+        i2c_stop();
+
+        i2c_start();
+        i2c_write((MPU_ADDR << 1) | 1); // Read address
+        uint8_t high_byte = i2c_read_ack();
+        uint8_t low_byte = i2c_read_nack();
+        i2c_stop();
+
+        GyZ_raw = ((int16_t)high_byte << 8) | low_byte;
+
+        gyroZsum += GyZ_raw;
+        _delay_ms(3);
+    }
+
+    gyroZoffset = gyroZsum / (float)numReadings;
+
+    uart_print("Gyro Z-axis offset: ");
+    uart_print_float(gyroZoffset);
+    uart_print("\r\nCalibration complete.\r\n");
+}
+
+//setting Gyro range
+void setGyroRange(uint8_t range) {
+    // range: 0 = 250 deg/s, 1 = 500 deg/s, 2 = 1000 deg/s, 3 = 2000 deg/s
+    uint8_t value = (range & 0x03) << 3;  // Convert to register value (bits 3 and 4)
+    
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0);  // MPU-6050 address, write mode
+    i2c_write(MPU_GYRO_CONFIG);      // Select GYRO_CONFIG register
+    i2c_write(value);                // Set the range bits
+    i2c_stop();
+
+    currentGyroRange = range;  // Update global variable
+}
+
+
+//set accel scale
+void setAccelScale(uint8_t range) {
+    switch(range) {
+        case 0: accelScale = ACCEL_SCALE_2G; break;
+        case 1: accelScale = ACCEL_SCALE_4G; break;
+        case 2: accelScale = ACCEL_SCALE_8G; break;
+        case 3: accelScale = ACCEL_SCALE_16G; break;
+        default: accelScale = ACCEL_SCALE_2G; break;
+    }
+}
+
+//set sample scale
+void setSampleRate(uint8_t sampleRate) {
+    // Write to the SMPLRT_DIV register (0x19) to set the sample rate
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0);  // Write mode
+    i2c_write(0x19);  // SMPLRT_DIV register address
+    i2c_write(sampleRate);  // Set sample rate divider value
+    i2c_stop();
+}
+

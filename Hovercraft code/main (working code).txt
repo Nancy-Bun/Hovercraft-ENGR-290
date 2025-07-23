@@ -1,0 +1,635 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdio.h>
+#include <math.h>
+#include "init_290.c"
+#include "I2C_290.c"
+
+// Pin Definitions
+#define TRIG_FRONT PB3     // Trigger Pin for Front US Sensor
+#define TRIG_TOP PB5       // Trigger Pin for Top US Sensor
+#define ECHO_FRONT PD2     // Echo Pin for Front US Sensor
+#define ECHO_TOP PD3       // Echo Pin for Top US Sensor
+#define FAN_LIFT_PIN PD6   // Lift fan connected to P4
+#define FAN_THRUST_PIN PD5 // Thrust fan connected to P3
+#define levitationFanPwm OCR0A // lift
+#define propulsion_fan_pwm OCR0B // thrust 
+#define propulsion_fan_direction OCR1A
+
+#define FAN_LIFT_DDR DDRD
+#define FAN_THRUST_DDR DDRD
+
+// MPU-6050 Registers
+#define MPU_ADDR         0x68
+#define MPU_PWR_MGMT_1   0x6B
+#define MPU_GYRO_CONFIG  0x1B
+
+// Gyro registers
+#define GYRO_ZOUT_H 0x47
+#define GYRO_ZOUT_L 0x48
+
+// Constants
+#define F_CPU 16000000UL   // CPU frequency
+#define BAUD 9600          // Baud rate for UART
+#define MYUBRR F_CPU/16/BAUD-1
+#define RAD_TO_DEG 57.2957795131
+
+// Servo limits
+#define SERVO_MIN 500      // 1ms pulse width
+#define SERVO_MAX 2500     // 2ms pulse width
+#define YAW_MIN   -81      // Minimum yaw angle
+#define YAW_MAX    81      // Maximum yaw angle
+
+// Gyro scale factors
+#define GYRO_SCALE_250  131.0  // For ±250 deg/s
+#define GYRO_SCALE_500  65.5   // For ±500 deg/s
+#define GYRO_SCALE_1000 32.8   // For ±1000 deg/s
+#define GYRO_SCALE_2000 16.4   // For ±2000 deg/s
+
+// Timing variables
+volatile unsigned long millisCount = 0;
+unsigned long prevTime = 0;
+unsigned long currTime = 0;
+float dt = 0.0;  // Delta time in seconds
+
+// Ultrasonic sensor variables
+volatile uint16_t duration = 0;
+volatile float frontDistanceCm = 0;
+volatile float topDistanceCm = 0;
+static volatile long leftDistance, rightDistance;
+
+// IMU variables - Only keeping yaw-related variables
+volatile int16_t GyZ_raw;
+volatile uint8_t isTurning = 0;
+volatile float GyZ;
+volatile float yaw = 0;
+float gyroZoffset = 0.0;
+uint8_t currentGyroRange = 0;  // Default: ±250 deg/s
+unsigned long lastTurnTime = 0;
+
+// Function prototypes
+void setup(void);
+void init_timer0(void);
+void init_timer1_servo(void);
+void setup_lift_fan(void);
+void setup_thrust_fan(void);
+void fan_lift_set_speed(uint8_t speed);
+void fan_thrust_set_speed(uint8_t speed);
+void all_fan_on(void);
+void all_fan_off(void);
+void fan_Lift_on(void);
+void fan_Lift_off(void);
+void fan_thrust_on(void);
+void fan_thrust_off(void);
+float measureDistance(uint8_t sensor);
+void calibrateGyro(void);
+void readYawData(void);
+void setGyroRange(uint8_t range);
+void UART_Transmit(char data);
+void UART_TransmitString(const char *str);
+void UART_print_float(float value);
+void set_servo_angle(uint8_t angle);
+void rotate_servo(int16_t angle);
+float Calculate_Yaw(void);
+void turn_correction(void);
+float getGyroScale(void);
+unsigned long millis(void);
+
+// Getting gyro scale based on range setting
+float getGyroScale() {
+    switch(currentGyroRange) {
+        case 0: return GYRO_SCALE_250;
+        case 1: return GYRO_SCALE_500;
+        case 2: return GYRO_SCALE_1000;
+        case 3: return GYRO_SCALE_2000;
+        default: return GYRO_SCALE_250;
+    }
+}
+
+int main(void) {
+    // Initialize peripherals
+    setup();
+    i2c_init();
+    init_timer0(); // For millis() function
+    init_timer1_servo(); // For servo control
+    setup_lift_fan();
+    setup_thrust_fan();
+    
+    // Initialize MPU-6050
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0);
+    i2c_write(MPU_PWR_MGMT_1);
+    i2c_write(0x00);
+    i2c_stop();
+    
+    // Setting the gyroscope range to ±250°/sec (default)
+    setGyroRange(0);
+    
+    // Wait for initialization
+    _delay_ms(500);
+    
+    // Calibrate gyroscope - only Z-axis
+    calibrateGyro();
+    
+    // Set servo to middle position (90 degrees)
+    set_servo_angle(90);
+    
+    // Enable global interrupts
+    sei();
+    
+    // Start fans
+    levitationFanPwm = 255; // start lift fan at max rpm
+    propulsion_fan_pwm = 225; // start thrust fan at max rpm
+    
+    prevTime = millis();
+
+    while (1) {
+        // Timing
+        currTime = millis();
+        dt = (currTime - prevTime) / 1000.0;  // Convert to seconds
+        prevTime = currTime;
+        
+        // Read IMU data - only Z-axis (yaw)
+        readYawData();
+        set_servo_angle(90); // center servo when not turning
+
+        // Update yaw
+        yaw += GyZ * dt;
+        
+        // Keep yaw in bounds
+        if (yaw > 180.0) yaw -= 360.0;
+        if (yaw < -180.0) yaw += 360.0;
+
+        if(!isTurning){
+        // Adjust servo to correct yaw drift
+        if (yaw >= YAW_MIN && yaw <= YAW_MAX) {
+            uint8_t servoAngle = (uint8_t)((yaw + 81) * (180.0 / 162.0));
+            set_servo_angle(servoAngle);
+        } else {
+            set_servo_angle(yaw < YAW_MIN ? 0 : 180);
+          }
+        }
+
+        _delay_ms(10);
+        
+        // Now handle ultrasonic sensors - lower priority
+        // Only check every X milliseconds to avoid disrupting IMU control
+        static unsigned long lastSensorCheck = 0;
+        if (currTime - lastSensorCheck > 100) { // Check every 100ms
+            lastSensorCheck = currTime;
+            measureDistance(ECHO_FRONT);
+            measureDistance(ECHO_TOP);
+            
+            // Logic to control motors/fans based on distance readings
+            if (topDistanceCm <= 40) {
+                UART_TransmitString("STOP ALL FANS - Top obstacle detected\n\r");
+                all_fan_off();
+                return 0;
+            }
+            else if ((currTime - lastTurnTime > 1000) && frontDistanceCm <= 50) {
+                UART_TransmitString("Front obstacle detected - initiating turn correction\n\r");
+                all_fan_off();
+                _delay_ms(100);
+                turn_correction();
+            }
+            _delay_ms(5);
+        }
+    }
+}
+
+// Setup Function
+void setup(void) {
+    // Set trigger pins (PB3, PB5) as output
+    DDRB |= (1 << TRIG_FRONT) | (1 << TRIG_TOP);
+
+    // Set echo pins (PD2, PD3) as input
+    DDRD &= ~(1 << ECHO_FRONT) & ~(1 << ECHO_TOP);
+
+    // Initialize Timer1 for pulse width measurement
+    TCCR1B = (1 << CS11); // Prescaler = 8
+
+    // Initialize UART
+    uint16_t ubrr_value = 103; // For 9600 baud rate (16MHz clock)
+    UBRR0H = (ubrr_value >> 8);
+    UBRR0L = ubrr_value;
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);   // Enable receiver and transmitter
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00); // 8-bit data frame
+}
+
+// Timer Functions
+void init_timer0(void) {
+    // Configure Timer0 for CTC mode and fast PWM
+    TCCR0A = (1 << WGM01) | (1 << WGM00); // Fast PWM mode
+    TCCR0A |= (1 << COM0A1) | (1 << COM0B1); // Non-inverting mode on OC0A and OC0B
+    TCCR0B = (1 << CS01) | (1 << CS00); // Prescaler 64
+    OCR0A = 0; // Initial PWM value (0% duty cycle)
+    OCR0B = 0; // Initial PWM value (0% duty cycle)
+    TIMSK0 = (1 << OCIE0A); // Enable Compare Match A interrupt
+}
+
+ISR(TIMER0_COMPA_vect) {
+    millisCount++;
+}
+
+unsigned long millis(void) {
+    unsigned long ms;
+    uint8_t sreg = SREG;
+    cli();
+    ms = millisCount;
+    SREG = sreg;
+    return ms;
+}
+
+// Timer1 for Servo Control
+void init_timer1_servo(void) {
+    // Set PB1 (OC1A) as output for servo control
+    DDRB |= (1 << PB1);
+
+    // Configure Timer1 for Fast PWM, TOP = ICR1
+    TCCR1A = (1 << WGM11) | (1 << COM1A1); // Mode 14, non-inverting mode
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11); // Prescaler = 8
+
+    // Set TOP value for 50Hz PWM frequency
+    ICR1 = 39999; // 16MHz / (8 * 50Hz) - 1
+
+    // Initialize servo to center position
+    OCR1A = 3000; // Corresponds to 1.5ms pulse width
+}
+
+//=============================================================================
+// UART Functions
+//=============================================================================
+
+// Transmit a single character over UART
+void UART_Transmit(char data) {
+    while (!(UCSR0A & (1 << UDRE0)));
+    UDR0 = data;
+}
+
+// Transmit a string over UART
+void UART_TransmitString(const char *str) {
+    while (*str) {
+        UART_Transmit(*str++);
+    }
+}
+
+// Print float value to UART
+void UART_print_float(float value) {
+    char buffer[20];
+    dtostrf(value, 6, 2, buffer);
+    UART_TransmitString(buffer);
+}
+
+//=============================================================================
+// Fan Control Functions
+//=============================================================================
+
+// Lift Fan Setup
+void setup_lift_fan() {
+    // Set lift fan pin as output
+    FAN_LIFT_DDR |= (1 << FAN_LIFT_PIN);
+
+    // Initialize with fan off
+    levitationFanPwm = 0;
+}
+
+void fan_lift_set_speed(uint8_t speed) {
+    // Constrain speed to valid range
+    if (speed > 100)
+        speed = 100;
+
+    // Convert percentage to PWM value (0-255)
+    levitationFanPwm = (uint8_t)((uint16_t)255 * speed / 100);
+}
+
+void fan_Lift_on() {
+    fan_lift_set_speed(94); // 94% speed
+}
+
+void fan_Lift_off() {
+    levitationFanPwm = 0;
+}
+
+// Thrust Fan Setup
+void setup_thrust_fan() {
+    // Set thrust fan pin as output
+    FAN_THRUST_DDR |= (1 << FAN_THRUST_PIN);
+
+    // Initialize with fan off
+    propulsion_fan_pwm = 0;
+}
+
+void fan_thrust_set_speed(uint8_t speed) {
+    // Constrain speed to valid range
+    if (speed > 100)
+        speed = 100;
+
+    // Convert percentage to PWM value (0-255)
+    propulsion_fan_pwm = (uint8_t)((uint16_t)255 * speed / 100);
+}
+
+void fan_thrust_on() {
+    fan_thrust_set_speed(25); // 25% speed
+}
+
+void fan_thrust_off() {
+    propulsion_fan_pwm = 0;
+}
+
+void all_fan_on() {
+    fan_thrust_set_speed(50);
+    fan_lift_set_speed(92);
+}
+
+void all_fan_off() {
+    fan_thrust_off();
+    fan_Lift_off();
+}
+
+//=============================================================================
+// Servo Control Functions
+//=============================================================================
+
+void set_servo_angle(uint8_t angle) {
+    if (angle > 180) angle = 180;
+    if (angle < 0) angle = 0;
+
+    // Map angle (0-180) to pulse width in microseconds
+    uint16_t pulse_us = SERVO_MIN + ((uint32_t)(SERVO_MAX - SERVO_MIN) * angle) / 180;
+
+    // Convert microseconds to timer ticks (assuming 0.5us per tick)
+    OCR1A = pulse_us * 2;
+}
+
+void rotate_servo(int16_t angle) {
+    // Set the servo to the target angle
+    set_servo_angle(angle);
+ 
+    // Calculate how far the current angle is from the center (90°)
+    int angle_diff = abs(90 - angle);  // Absolute difference from 90° (center)
+
+    // Control delay based on how far the angle is from 90°
+    if (angle_diff < 30) {
+        _delay_ms(100);  // Close to 90°, quick response
+    } else if (angle_diff < 60) {
+        _delay_ms(200);  // Moderately far from 90°, moderate response
+    } else {
+        _delay_ms(300);  // Far from 90°, slower response
+    }
+}
+
+//=============================================================================
+// MPU-6050 Functions
+//=============================================================================
+
+// Set gyroscope range
+void setGyroRange(uint8_t range) {
+    // range: 0 = 250 deg/s, 1 = 500 deg/s, 2 = 1000 deg/s, 3 = 2000 deg/s
+    uint8_t value = (range & 0x03) << 3;  // Convert to register value (bits 3 and 4)
+    
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0);  // MPU-6050 address, write mode
+    i2c_write(MPU_GYRO_CONFIG);      // Select GYRO_CONFIG register
+    i2c_write(value);                // Set the range bits
+    i2c_stop();
+
+    currentGyroRange = range;  // Update global variable
+}
+
+// Read yaw data (only Z-axis gyro)
+void readYawData() {
+    uint8_t data[2]; // Buffer for Z-axis gyro data only
+
+    // Start communication with MPU-6050
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 0); // Write address
+    i2c_write(GYRO_ZOUT_H); // Starting register
+    i2c_stop();
+
+    // Read 2 bytes for Z-axis gyro
+    i2c_start();
+    i2c_write((MPU_ADDR << 1) | 1); // Read address
+    data[0] = i2c_read_ack(); // High byte
+    data[1] = i2c_read_nack(); // Low byte
+    i2c_stop();
+
+    // Convert raw data to actual values
+    GyZ_raw = ((int16_t)data[0] << 8) | data[1];
+    
+    // Convert to physical units
+    GyZ = (GyZ_raw - gyroZoffset) / getGyroScale();
+}
+
+// Calibrate gyroscope - Z-axis only
+void calibrateGyro(void) {
+    uint16_t numReadings = 2000;
+    long gyroZsum = 0;
+
+    UART_TransmitString("Calibrating gyroscope Z-axis...\r\n");
+
+    for (uint16_t i = 0; i < numReadings; i++) {
+        // Read Z-axis gyroscope data
+        i2c_start();
+        i2c_write((MPU_ADDR << 1) | 0); // Write address
+        i2c_write(GYRO_ZOUT_H); // Starting register
+        i2c_stop();
+
+        i2c_start();
+        i2c_write((MPU_ADDR << 1) | 1); // Read address
+        uint8_t zh = i2c_read_ack();
+        uint8_t zl = i2c_read_nack();
+        i2c_stop();
+
+        GyZ_raw = ((int16_t)zh << 8) | zl;
+        gyroZsum += GyZ_raw;
+        
+        _delay_ms(3);
+    }
+
+    gyroZoffset = gyroZsum / (float)numReadings;
+
+    UART_TransmitString("Gyro Z-axis calibration complete. Offset: Z=");
+    UART_print_float(gyroZoffset);
+    UART_TransmitString("\r\n");
+}
+
+// Calculate yaw
+float Calculate_Yaw() {
+    yaw += GyZ * dt;
+    
+    // Keep yaw within -180 to +180 degrees
+    if (yaw > 180.0) yaw -= 360.0;
+    if (yaw < -180.0) yaw += 360.0;
+    
+    return yaw;
+}
+
+//=============================================================================
+// Ultrasonic Sensor Functions
+//=============================================================================
+
+float measureDistance(uint8_t sensor)
+{
+  uint8_t trigPin = (sensor == ECHO_FRONT) ? TRIG_FRONT : TRIG_TOP;
+  uint8_t echoPin = sensor;
+
+  // Send a 10us pulse to trigger the sensor
+  PORTB &= ~(1 << trigPin); // Set trigPin low
+  _delay_us(5);
+  PORTB |= (1 << trigPin); // Set trigPin high
+  _delay_us(10);
+  PORTB &= ~(1 << trigPin); // Set trigPin low
+
+  // Measure the pulse width on echoPin
+  while (!(PIND & (1 << echoPin)))
+    ;        // Wait for echoPin to go high
+  TCNT1 = 0; // Reset Timer1 counter
+  while (PIND & (1 << echoPin))
+    ;                     // Wait for echoPin to go low
+  duration = TCNT1 * 0.5; // Duration in microseconds (prescaler = 8)
+
+  // Calculate distance in cm
+  uint16_t distance_cm = (duration / 2) / 29;
+
+  // Store the distance based on the sensor
+  if (sensor == ECHO_FRONT)
+  {
+    frontDistanceCm = distance_cm;
+    // Send distance over UART
+    char buffer[50];
+    sprintf(buffer, "%s Distance: %u cm\n", (sensor == ECHO_FRONT) ? "Front" : "Top", distance_cm);
+    UART_TransmitString(buffer);
+    _delay_ms(200);
+    return frontDistanceCm;
+  }
+  else if (sensor == ECHO_TOP)
+  {
+    topDistanceCm = distance_cm;
+    // Send distance over UART
+    char buffer[50];
+    sprintf(buffer, "%s Distance: %u cm\n", (sensor == ECHO_FRONT) ? "Front" : "Top", distance_cm);
+    UART_TransmitString(buffer);
+    _delay_ms(200);
+    return topDistanceCm;
+  }
+}
+
+
+//=============================================================================
+// Navigation Functions
+//=============================================================================
+
+
+void turn_correction()
+{
+    isTurning = 1; // Disable yaw stabilization during turn
+
+    // Scan Left
+    set_servo_angle(0);
+    _delay_ms(500);
+    UART_TransmitString("Measuring distance to the left...\r\n");
+    float leftDistance = measureDistance(ECHO_FRONT);
+
+    // Scan Center
+    set_servo_angle(90);
+    _delay_ms(500);
+    UART_TransmitString("Measuring distance straight ahead...\r\n");
+    float centerDistance = measureDistance(ECHO_FRONT);
+
+    // Scan Right
+    set_servo_angle(180);
+    _delay_ms(500);
+    UART_TransmitString("Measuring distance to the right...\r\n");
+    float rightDistance = measureDistance(ECHO_FRONT);
+
+    // Determine best direction
+    float distances[3] = {leftDistance, centerDistance, rightDistance};
+    uint8_t bestDirection = 0;
+    float maxDistance = 0.0;
+
+    for (uint8_t i = 0; i < 3; i++) {
+        if (distances[i] > maxDistance) {
+            maxDistance = distances[i];
+            bestDirection = i;
+        }
+    }
+
+    // Check for tie (multiple directions with maxDistance)
+    uint8_t tieCount = 0;
+    for (uint8_t i = 0; i < 3; i++) {
+        if (fabs(distances[i] - maxDistance) < 1.0) { // Tolerance of 1cm
+            tieCount++;
+        }
+    }
+
+    float targetYaw = yaw;  // Default to current yaw
+
+    if (tieCount == 1) {
+        // No tie - choose direction based on bestDirection
+        switch (bestDirection) {
+            case 0: targetYaw = yaw - 45.0; break;  // Left
+            case 1: targetYaw = yaw; break;         // Center
+            case 2: targetYaw = yaw + 45.0; break;  // Right
+        }
+    } else {
+        UART_TransmitString("Multiple directions are optimal - Going straight\r\n");
+        set_servo_angle(90);  // Pre-center servo
+    }
+
+    // Normalize targetYaw between -180 and 180
+    if (targetYaw > 180.0) targetYaw -= 360.0;
+    if (targetYaw < -180.0) targetYaw += 360.0;
+
+    UART_TransmitString("Turning towards target yaw...\r\n");
+
+    float totalTurnedAngle = 0.0;
+    unsigned long turnStartTime = millis();
+
+
+    while (fabs(yaw - targetYaw) > 20) {  // Tolerance of 15 degrees
+
+        levitationFanPwm = 255;
+        propulsion_fan_pwm = 150;
+
+        if (yaw < targetYaw) {
+            set_servo_angle(180); // Turn right
+        } else {
+            set_servo_angle(0);  // Turn left
+        }
+
+        _delay_ms(100);
+
+        readYawData();
+        yaw += GyZ * dt;
+
+        if (yaw > 180.0) yaw -= 360.0;
+        if (yaw < -180.0) yaw += 360.0;
+
+        // Accumulate total turning angle
+        totalTurnedAngle += fabs(GyZ * dt);
+
+        // Check if turning too long or turned > 360 degrees
+        if (totalTurnedAngle >= 360.0 || (millis() - turnStartTime) > 5000) {  // 5 seconds max
+        UART_TransmitString("Exceeded safe turn limit - Forcing return to target yaw\r\n");
+        break; // Exit turning loop to stabilize
+        }
+    }
+
+    UART_TransmitString("Reached target yaw. Resetting yaw to 0.\r\n");
+
+    yaw = 0;
+    set_servo_angle(90);  // Center servo
+
+    levitationFanPwm = 255;
+    propulsion_fan_pwm = 225;
+
+    // Move forward after turn
+    UART_TransmitString("Moving forward after turn...\r\n");
+    _delay_ms(1500);  // Move forward 1 second
+
+    // Record turn completion time for cooldown
+    lastTurnTime = millis();
+
+    isTurning = 0;
+}
